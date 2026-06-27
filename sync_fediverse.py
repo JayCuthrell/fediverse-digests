@@ -94,15 +94,11 @@ def fetch_posts(all_history=False):
     all_statuses.sort(key=lambda x: x["created_at"])
     return all_statuses
 
-def clean_html_to_markdown(html_content):
+def clean_html_to_markdown(html_content, converter):
     """Converts GoToSocial HTML safely into clean, layout-friendly Markdown."""
     if not html_content:
         return ""
-    h = html2text.HTML2Text()
-    h.ignore_links = False
-    h.ignore_images = False
-    h.body_width = 0  # Disable line wrapping artifacts inside codeblocks/paragraphs
-    return h.handle(html_content).strip()
+    return converter.handle(html_content).strip()
 
 def process_and_write_digests(statuses):
     """Groups statuses by calendar month and outputs pure Markdown matching layout conventions."""
@@ -119,6 +115,12 @@ def process_and_write_digests(statuses):
             monthly_buckets[month_key] = []
         monthly_buckets[month_key].append(status)
         
+    # Initialize the HTML to Markdown converter once to reuse it.
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = False
+    h.body_width = 0  # Disable line wrapping
+
     for month_key, month_statuses in monthly_buckets.items():
         dt_sample = datetime.datetime.strptime(month_key, "%Y-%m")
         year = dt_sample.year
@@ -138,7 +140,7 @@ title: "My Fediverse Digest for {month_name} {year}"
 description: "A monthly digest of my thoughts, links, and updates from the Fediverse for {month_name} {year}."
 date: {last_date_str}
 permalink: /archive/fediverse-digest-{month_key}/
-tags: ["fediverse"]
+tags: ["Fediverse"]
 ---
 """
         # Reset day tracking for each new file
@@ -155,7 +157,7 @@ tags: ["fediverse"]
                 last_day_str = current_day_str
 
             time_stamp = status_dt_eastern.strftime("%I:%M %p")
-            markdown_content = clean_html_to_markdown(s["content"])
+            markdown_content = clean_html_to_markdown(s["content"], h)
 
             # Wrap content in {% raw %} to prevent Eleventy from parsing it as a template
             escaped_content = f"{{% raw %}}\n{markdown_content}\n{{% endraw %}}"
