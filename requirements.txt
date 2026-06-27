@@ -1,14 +1,3 @@
-# Core Logic
 requests
 python-dotenv
 html2text
-beautifulsoup4
-# pillow
-# atproto
-#google.genai
-
-# Web Server
-# fastapi
-# uvicorn
-# jinja2
-# python-multipart
