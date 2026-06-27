@@ -155,8 +155,10 @@ tags: ["fediverse", "digest"]
 
             time_stamp = status_dt_eastern.strftime("%I:%M %p")
             markdown_content = clean_html_to_markdown(s["content"])
-            
-            markdown_output += f"### {time_stamp}\n\n{markdown_content}\n\n[Source]({s['url']})\n\n---\n\n"
+
+            # Wrap content in {% raw %} to prevent Eleventy from parsing it as a template
+            escaped_content = f"{{% raw %}}\n{markdown_content}\n{{% endraw %}}"
+            markdown_output += f"### {time_stamp}\n\n{escaped_content}\n\n[Source]({s['url']})\n\n---\n\n"
             
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(markdown_output)
