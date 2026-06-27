@@ -119,8 +119,6 @@ def process_and_write_digests(statuses):
             monthly_buckets[month_key] = []
         monthly_buckets[month_key].append(status)
         
-    last_day_str = ""
-
     for month_key, month_statuses in monthly_buckets.items():
         dt_sample = datetime.datetime.strptime(month_key, "%Y-%m")
         year = dt_sample.year
@@ -143,6 +141,9 @@ permalink: /archive/fediverse/{month_key}/
 tags: ["fediverse", "digest"]
 ---
 """
+        # Reset day tracking for each new file
+        last_day_str = ""
+
         for s in month_statuses:
             status_dt = datetime.datetime.fromisoformat(s["created_at"].replace("Z", "+00:00"))
             # Convert to the desired timezone
