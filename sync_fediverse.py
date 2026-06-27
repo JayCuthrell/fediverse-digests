@@ -137,8 +137,8 @@ def process_and_write_digests(statuses):
 title: "My Fediverse Digest for {month_name} {year}"
 description: "A monthly digest of my thoughts, links, and updates from the Fediverse for {month_name} {year}."
 date: {last_date_str}
-permalink: /archive/fediverse/{month_key}/
-tags: ["fediverse", "digest"]
+permalink: /archive/fediverse-digest-{month_key}/
+tags: ["fediverse"]
 ---
 """
         # Reset day tracking for each new file
