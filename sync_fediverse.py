@@ -2,7 +2,7 @@
 """
 sync_fediverse.py - Extract GoToSocial posts natively from SQLite
 (with fallback to REST API) and generate 11ty Markdown monthly digests.
-Supports raw Markdown text, hotlinked images, and native HTML5 video tags.
+Supports raw Markdown text, hotlinked images, audio, and native HTML5 video tags.
 """
 
 import os
@@ -17,10 +17,8 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load local .env file variables
 load_dotenv()
 
-# Global configuration with environment fallbacks
 CONFIG = {
     "db_path": os.getenv("GTS_DB_PATH", "gts.db"),
     "instance_url": os.getenv("GOTOSOCIAL_INSTANCE_URL", "https://cuthrell.com").rstrip("/"),
@@ -38,6 +36,7 @@ def format_media_html(media_list: list) -> str:
     """
     Render media attachments into HTML.
     - Videos render as <video> players.
+    - Audio renders as <audio> players.
     - Images render as <img> with eleventy:ignore so Sharp/11ty-img won't fail during build.
     """
     if not media_list:
@@ -50,12 +49,20 @@ def format_media_html(media_list: list) -> str:
             continue
 
         raw_desc = item.get("alt") or "Attached media"
-        alt = raw_desc.replace("\n", " ").replace('"', '&quot;').strip()
-        media_type = (item.get("type") or "").lower()
+        alt = str(raw_desc).replace("\n", " ").replace('"', '&quot;').strip()
 
-        # Detect video by mime/type or file extension
-        is_video = media_type in ["video", "gifv"] or any(
+        # Handle integer enum (GTS SQLite) or string (REST API)
+        raw_type = item.get("type")
+        media_type = str(raw_type).lower().strip() if raw_type is not None else ""
+
+        # Detect video: GTS enum 2 (video), 3 (gifv), or video extensions
+        is_video = media_type in ["2", "3", "video", "gifv"] or any(
             url.lower().endswith(ext) for ext in [".mp4", ".m4v", ".webm", ".mov"]
+        )
+
+        # Detect audio: GTS enum 4 (audio) or audio extensions
+        is_audio = media_type in ["4", "audio"] or any(
+            url.lower().endswith(ext) for ext in [".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac"]
         )
 
         if is_video:
@@ -64,6 +71,13 @@ def format_media_html(media_list: list) -> str:
                 f'  <source src="{url}">\n'
                 f'  Your browser does not support the video tag.\n'
                 f'</video>'
+            )
+        elif is_audio:
+            rendered_items.append(
+                f'<audio controls preload="metadata" class="feed-media">\n'
+                f'  <source src="{url}">\n'
+                f'  Your browser does not support the audio tag.\n'
+                f'</audio>'
             )
         else:
             # eleventy:ignore tells @11ty/eleventy/html-transformer to bypass Sharp optimization
@@ -88,7 +102,6 @@ def extract_from_sqlite(db_path: str, username: str, all_history: bool = False):
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    # Find the local account ID
     cursor.execute("SELECT id FROM accounts WHERE username = ? AND (domain IS NULL OR domain = '')", (username,))
     account = cursor.fetchone()
     if not account:
@@ -136,7 +149,6 @@ def extract_from_sqlite(db_path: str, username: str, all_history: bool = False):
             if opt in media_columns:
                 select_cols.append(opt)
 
-        # Batch query in chunks to stay well under SQLite parameter limits
         chunk_size = 500
         for i in range(0, len(status_ids), chunk_size):
             chunk = status_ids[i:i + chunk_size]
@@ -194,7 +206,7 @@ def extract_from_sqlite(db_path: str, username: str, all_history: bool = False):
 
 
 def fetch_from_api(all_history: bool = False):
-    """Fallback fetcher using the GoToSocial / Mastodon REST API."""
+    """Fallback fetcher using GoToSocial REST API."""
     if not CONFIG["access_token"]:
         print("CRITICAL ERROR: No local database found and GOTOSOCIAL_ACCESS_TOKEN is missing.")
         sys.exit(1)
@@ -326,10 +338,8 @@ def main():
     parser.add_argument("--db", type=str, default=CONFIG["db_path"], help="Path to local SQLite gts.db")
     args = parser.parse_args()
 
-    # Step 1: Attempt native SQLite extraction from local DB
     target_posts = extract_from_sqlite(args.db, CONFIG["username"], all_history=args.backfill)
 
-    # Step 2: Fall back to REST API if SQLite file is absent
     if target_posts is None:
         print(f"Database not found at '{args.db}'. Falling back to REST API...")
         target_posts = fetch_from_api(all_history=args.backfill)
