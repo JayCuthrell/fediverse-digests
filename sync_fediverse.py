@@ -1,173 +1,204 @@
+#!/usr/bin/env python3
 import os
 import sys
+import sqlite3
 import argparse
-import requests
-import datetime
 import calendar
+import datetime
+import requests
 import html2text
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
-# Load local .env file variables
 load_dotenv()
 
-# --- Fallback Configuration from Environment Variables ---
 CONFIG = {
+    "db_path": os.getenv("GTS_DB_PATH", "gts.db"),
     "instance_url": os.getenv("GOTOSOCIAL_INSTANCE_URL", "https://cuthrell.com").rstrip("/"),
     "access_token": os.getenv("GOTOSOCIAL_ACCESS_TOKEN"),
     "account_id": os.getenv("GOTOSOCIAL_ACCOUNT_ID"),
-    "output_dir": "./src/posts/fediverse",
+    "username": os.getenv("GTS_ACCOUNT_USERNAME", "jay"),
+    "output_dir": os.getenv("DIGEST_OUTPUT_DIR", "./src/posts/fediverse"),
     "timezone": os.getenv("BLOG_TIMEZONE", "US/Eastern")
 }
 
-# Define the target timezone globally
 TARGET_TZ = ZoneInfo(CONFIG["timezone"])
 
-def verify_and_detect_config():
-    if not CONFIG["access_token"]:
-        print("CRITICAL ERROR: GOTOSOCIAL_ACCESS_TOKEN is missing from your environment or .env file.")
-        sys.exit(1)
-        
-    headers = {"Authorization": f"Bearer {CONFIG['access_token']}"}
-    
-    if not CONFIG["account_id"]:
-        print("Discovering Account ID via credentials verification...")
-        try:
-            response = requests.get(f"{CONFIG['instance_url']}/api/v1/accounts/verify_credentials", headers=headers)
-            response.raise_for_status()
-            CONFIG["account_id"] = response.json()["id"]
-            print(f" -> Auto-detected Account ID: {CONFIG['account_id']}")
-        except Exception as e:
-            print(f"CRITICAL ERROR: Failed to reach GoToSocial or verify token: {e}")
-            sys.exit(1)
 
-def fetch_posts(all_history=False):
-    url = f"{CONFIG['instance_url']}/api/v1/accounts/{CONFIG['account_id']}/statuses"
-    headers = {"Authorization": f"Bearer {CONFIG['access_token']}"}
-    params = {
-        "limit": 40,
-        "exclude_replies": True,
-        "exclude_reblogs": True
-    }
-    
+def extract_from_sqlite(db_path: str, username: str, all_history: bool = False):
+    """Read native Markdown and media attachments directly from GoToSocial's SQLite database."""
+    if not os.path.exists(db_path):
+        return None
+
+    print(f"Reading natively from SQLite database: {db_path}")
+    conn = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # Locate account ID
+    cursor.execute("SELECT id FROM accounts WHERE username = ? AND (domain IS NULL OR domain = '')", (username,))
+    account = cursor.fetchone()
+    if not account:
+        conn.close()
+        raise ValueError(f"Account '{username}' not found in {db_path}")
+
+    account_id = account["id"]
+
+    # Match posts (0, 1, 2 for public/unlisted enums)
+    query = """
+        SELECT id, created_at, text, content, url
+        FROM statuses
+        WHERE account_id = ?
+          AND (boost_of_id IS NULL OR boost_of_id = '')
+          AND (in_reply_to_id IS NULL OR in_reply_to_id = '')
+          AND visibility IN (0, 1, 2, 'public', 'unlisted')
+    """
+    params = [account_id]
+
     now_local = datetime.datetime.now(TARGET_TZ)
-    start_of_current_month_local = datetime.datetime(now_local.year, now_local.month, 1, tzinfo=TARGET_TZ)
-    
-    all_statuses = []
-    keep_fetching = True
-    
-    print(f"Fetching posts from {CONFIG['instance_url']}...")
-    
-    while url and keep_fetching:
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code != 200:
-            print(f"API Error: {response.status_code} - {response.text}")
-            break
-            
-        statuses = response.json()
-        if not statuses:
-            break
-            
-        for status in statuses:
-            utc_dt = datetime.datetime.fromisoformat(status["created_at"].replace("Z", "+00:00"))
-            local_dt = utc_dt.astimezone(TARGET_TZ)
-            
-            if all_history or local_dt >= start_of_current_month_local:
-                all_statuses.append(status)
-            else:
-                if not all_history:
-                    keep_fetching = False
-                    break
-                    
-        print(f" -> Retrieved {len(statuses)} posts... Total kept: {len(all_statuses)}")
-        
-        if keep_fetching and "next" in response.links:
-            url = response.links["next"]["url"]
-            params = {}  
-        else:
-            url = None
-            
-    all_statuses.sort(key=lambda x: x["created_at"])
-    return all_statuses
+    if not all_history:
+        start_month_utc = datetime.datetime(now_local.year, now_local.month, 1, tzinfo=TARGET_TZ).astimezone(datetime.timezone.utc)
+        query += " AND created_at >= ?"
+        params.append(start_month_utc.strftime("%Y-%m-%d %H:%M:%S"))
 
-def clean_html_to_markdown(html_content, converter):
-    if not html_content:
-        return ""
-    return converter.handle(html_content).strip()
+    query += " ORDER BY created_at ASC"
+    cursor.execute(query, params)
+    status_rows = cursor.fetchall()
+
+    if not status_rows:
+        conn.close()
+        return []
+
+    status_ids = [row["id"] for row in status_rows]
+
+    # Inspect media_attachments schema dynamically
+    cursor.execute("PRAGMA table_info(media_attachments);")
+    media_columns = {col["name"] for col in cursor.fetchall()}
+
+    attachments_by_status = {}
+    if "status_id" in media_columns:
+        placeholders = ",".join("?" for _ in status_ids)
+        # Select available columns
+        select_cols = ["id", "status_id"]
+        for opt in ["description", "remote_url", "file_path"]:
+            if opt in media_columns:
+                select_cols.append(opt)
+
+        media_sql = f"SELECT {', '.join(select_cols)} FROM media_attachments WHERE status_id IN ({placeholders})"
+        cursor.execute(media_sql, status_ids)
+        media_rows = cursor.fetchall()
+
+        instance_base = CONFIG["instance_url"]
+
+        for m in media_rows:
+            sid = m["status_id"]
+            if sid not in attachments_by_status:
+                attachments_by_status[sid] = []
+
+            # Determine public hotlink URL
+            remote_url = m["remote_url"] if "remote_url" in media_columns else None
+            file_path = m["file_path"] if "file_path" in media_columns else None
+
+            if remote_url and remote_url.strip():
+                image_url = remote_url.strip()
+            elif file_path and file_path.strip():
+                clean_path = file_path.lstrip("/")
+                image_url = f"{instance_base}/fileserver/{clean_path}"
+            else:
+                image_url = f"{instance_base}/fileserver/{account_id}/attachment/original/{m['id']}"
+
+            raw_desc = (m["description"] if "description" in media_columns else None) or "Attached image"
+            alt_text = raw_desc.replace("\n", " ").replace('"', '&quot;').strip()
+
+            attachments_by_status[sid].append({"url": image_url, "alt": alt_text})
+
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.body_width = 0
+
+    posts = []
+    for r in status_rows:
+        content = r["text"] if r["text"] and r["text"].strip() else h.handle(r["content"] or "").strip()
+        
+        # Attach images directly to markdown
+        media_items = attachments_by_status.get(r["id"], [])
+        if media_items:
+            img_markdown = "\n\n" + "\n\n".join(f"![{m['alt']}]({m['url']})" for m in media_items)
+            content += img_markdown
+
+        posts.append({
+            "id": r["id"],
+            "created_at": r["created_at"],
+            "content": content,
+            "url": r["url"] or f"{CONFIG['instance_url']}/@{username}/statuses/{r['id']}"
+        })
+
+    conn.close()
+    return posts
+
 
 def process_and_write_digests(statuses):
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
-    
     monthly_buckets = {}
 
-    for status in statuses:
-        # ---------------------------------------------------------
-        # THE CRITICAL FIX: Convert to Eastern BEFORE bucketing
-        # ---------------------------------------------------------
-        utc_dt = datetime.datetime.fromisoformat(status["created_at"].replace("Z", "+00:00"))
+    for s in statuses:
+        utc_dt = datetime.datetime.fromisoformat(s["created_at"].replace("Z", "+00:00"))
         local_dt = utc_dt.astimezone(TARGET_TZ)
-        
-        # Now month_key will correctly be "2026-06"
         month_key = local_dt.strftime("%Y-%m")
+
         if month_key not in monthly_buckets:
             monthly_buckets[month_key] = []
-        monthly_buckets[month_key].append(status)
-        
-    h = html2text.HTML2Text()
-    h.ignore_links = False
-    h.ignore_images = False
-    h.body_width = 0  
+        monthly_buckets[month_key].append((local_dt, s))
 
-    for month_key, month_statuses in monthly_buckets.items():
+    today = datetime.date.today()
+
+    for month_key, month_entries in monthly_buckets.items():
         dt_sample = datetime.datetime.strptime(month_key, "%Y-%m")
-        year = dt_sample.year
-        month_num = dt_sample.month
+        year, month_num = dt_sample.year, dt_sample.month
         month_name = dt_sample.strftime("%B")
-        
+
         last_day = calendar.monthrange(year, month_num)[1]
-        last_date_str = f"{year}-{month_num:02d}-{last_day:02d}"
-        
-        file_name = f"digest-{last_date_str}.md"
-        file_path = os.path.join(CONFIG["output_dir"], file_name)
-        
+        calendar_end_date = datetime.date(year, month_num, last_day)
+
+        # Avoid future dates on active current month
+        post_date = min(calendar_end_date, today) if (year == today.year and month_num == today.month) else calendar_end_date
+        post_date_str = post_date.strftime("%Y-%m-%d")
+
+        file_path = os.path.join(CONFIG["output_dir"], f"digest-{calendar_end_date.strftime('%Y-%m-%d')}.md")
+
         markdown_output = f"""---
 title: "My Fediverse Digest for {month_name} {year}"
 description: "A monthly digest of my thoughts, links, and updates from the Fediverse for {month_name} {year}."
-date: {last_date_str}
+date: {post_date_str}
 permalink: /archive/fediverse-digest-{month_key}/
 tags: ["Fediverse"]
 ---
 """
         last_day_str = ""
-
-        for s in month_statuses:
-            status_dt = datetime.datetime.fromisoformat(s["created_at"].replace("Z", "+00:00"))
-            status_dt_local = status_dt.astimezone(TARGET_TZ)
-
-            current_day_str = status_dt_local.strftime("%b %d")
+        for local_dt, s in month_entries:
+            current_day_str = local_dt.strftime("%b %d")
             if current_day_str != last_day_str:
                 markdown_output += f"\n## {current_day_str}\n\n"
                 last_day_str = current_day_str
 
-            time_stamp = status_dt_local.strftime("%I:%M %p")
-            markdown_content = clean_html_to_markdown(s["content"], h)
-
-            escaped_content = f"{{% raw %}}\n{markdown_content}\n{{% endraw %}}"
+            time_stamp = local_dt.strftime("%I:%M %p")
+            escaped_content = f"{{% raw %}}\n{s['content']}\n{{% endraw %}}"
             markdown_output += f"### {time_stamp}\n\n{escaped_content}\n\n[Source]({s['url']})\n\n---\n\n"
-            
+
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(markdown_output)
-            
-        print(f"Generated Layout File: {file_path} ({len(month_statuses)} entries synced)")
+
+        print(f"Generated Layout File: {file_path} ({len(month_entries)} entries synced)")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GoToSocial to Eleventy Monthly Digest Automation Script")
-    parser.add_argument("--backfill", action="store_true", help="Fetch complete account historical profile instead of just the current month")
+    parser = argparse.ArgumentParser(description="Generate 11ty Monthly Digests with hotlinked images")
+    parser.add_argument("--backfill", action="store_true", help="Fetch full history instead of current month")
+    parser.add_argument("--db", type=str, default=CONFIG["db_path"], help="Path to local SQLite gts.db")
     args = parser.parse_args()
-    
-    verify_and_detect_config()
-    target_posts = fetch_posts(all_history=args.backfill)
-    
+
+    target_posts = extract_from_sqlite(args.db, CONFIG["username"], all_history=args.backfill)
+
     if target_posts:
         process_and_write_digests(target_posts)
         print("\nSuccess! Sync execution completed cleanly.")
